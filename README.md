@@ -8,7 +8,7 @@ The implementation demonstrates language parsing, explicit state management, mac
 
 - Parses and executes all four primitive L instructions.
 - Expands variable assignment and unconditional jumps as source-level macros before execution.
-- Keeps macro definitions in a separate, extensible `macros.py` registry.
+- Discovers macro definitions automatically from the modular `macros/` package.
 - Provides syntax checking, expanded program listings, and step-by-step execution traces.
 - Reports duplicate and undefined labels while preserving their legal execution semantics.
 - Applies a configurable primitive-instruction limit to bound execution when exploring potentially non-terminating programs.
@@ -32,27 +32,32 @@ Execution terminates when it passes the final instruction or takes a jump to an 
 
 **Macro system**
 
-Macros are defined in [macros.py](macros.py), not in the interpreter runtime. `l_interpreter.py` only executes the four primitive operations; before parsing, the macro registry rewrites recognized macro instructions into primitive L code.
-
-The built-in registry currently contains:
+The interpreter runtime only executes the four primitive L operations. Source-level macros are expanded first by the `macros/` package.
 
 ```text
-GOTO L
-V <- W
-V ← W
+macros/
+├── __init__.py      # Automatic module discovery
+├── registry.py      # Registry and expansion context
+├── assignment.py    # V <- W / V ← W
+└── goto.py          # GOTO L
 ```
 
-Each expansion receives a `MacroExpansionContext` that can allocate fresh `Z` variables and labels without colliding with names already present in the source program. This makes macros composable with ordinary L code and keeps temporary implementation details out of the user's namespace.
+`macros/__init__.py` automatically imports every non-private `.py` module in the package except `registry.py`. This means a new macro normally requires only one new file; neither `l_interpreter.py` nor `macros/__init__.py` needs to be edited.
 
-To add another macro, register an expansion function in `macros.py`:
+Each expansion receives a `MacroExpansionContext` that can allocate fresh `Z` variables and labels without colliding with names already present in the source program.
+
+To add a macro, create a file such as `macros/clear.py`:
 
 ```python
+from .registry import IDENTIFIER_PATTERN, macro
+
+
 @macro(
     name="CLEAR",
     pattern=rf"\s*CLEAR\s+(?P<var>{IDENTIFIER_PATTERN})\s*",
     syntax="CLEAR V",
 )
-def _expand_clear(match, context):
+def expand_clear(match, context):
     variable = match.group("var")
     guard = context.new_variable()
     test = context.new_label("CLEAR_TEST")
@@ -69,7 +74,7 @@ def _expand_clear(match, context):
     )
 ```
 
-Expansion functions must return one or more **primitive L instructions**. Once registered, the new syntax is accepted automatically by the parser and shown in `--help` without changes to `l_interpreter.py`.
+Expansion functions must return one or more **primitive L instructions**. Registered macro syntax is picked up automatically by the parser and displayed by `--help`. Duplicate macro names are rejected during registration.
 
 **Command-line options**
 
@@ -85,10 +90,10 @@ python3 l_interpreter.py PROGRAM [INPUT ...] [OPTIONS]
 | `--max-steps N` | Set a positive primitive-instruction limit; defaults to `100000`. |
 | `--help` | Display usage, primitive syntax, and registered macros. |
 
-Because macros are now genuine source expansions, one macro instruction can execute as several primitive steps. Reaching the step limit does not prove that a program runs forever: it may require more instructions to finish.
+Because macros are genuine source expansions, one macro instruction can execute as several primitive steps. Reaching the step limit does not prove that a program runs forever: it may require more instructions to finish.
 
 **Implementation and scope**
 
-[l_interpreter.py](l_interpreter.py) contains the primitive parser, execution engine, diagnostics, and command-line handling. [macros.py](macros.py) contains the macro registry, fresh-name allocator, and built-in macro definitions.
+[l_interpreter.py](l_interpreter.py) contains the primitive parser, execution engine, diagnostics, and command-line handling. [`macros/registry.py`](macros/registry.py) provides the reusable macro infrastructure, while each concrete macro is isolated in its own module.
 
-This is an educational interpreter. The macro registry is extensible in Python, but `.l` source files do not currently define their own macro bodies. Function-call assignment and predicate macros from later parts of the notes can be added to `macros.py` when their intended notation and expansion rules are needed.
+This is an educational interpreter. The macro package is extensible in Python, but `.l` source files do not currently define their own macro bodies. Function-call assignment and predicate macros from later parts of the notes can be added as separate files under `macros/` when their intended notation and expansion rules are needed.
