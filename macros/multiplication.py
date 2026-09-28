@@ -38,15 +38,45 @@ def expand_multiplication(
     guard = context.new_variable()
 
     instructions: list[str] = [
+        # Used to implement unconditional jumps.
+        #
+        # It does not matter if this macro is executed more than once:
+        # guard only needs to remain non-zero.
         f"{guard}++",
     ]
+
+    def clear_variable(
+        variable: str,
+        prefix: str,
+    ) -> None:
+        """Set an auxiliary variable to zero."""
+
+        clear_test = context.new_label(f"{prefix}_CLEAR_TEST")
+        clear_step = context.new_label(f"{prefix}_CLEAR_STEP")
+        clear_done = context.new_label(f"{prefix}_CLEAR_DONE")
+
+        instructions.extend(
+            (
+                f"({clear_test}) IF {variable} != 0 GOTO {clear_step}",
+                f"IF {guard} != 0 GOTO {clear_done}",
+
+                f"({clear_step}) {variable}--",
+                f"IF {guard} != 0 GOTO {clear_test}",
+
+                f"({clear_done}) {variable}==",
+            )
+        )
 
     def copy_preserving(
         source: str,
         destination: str,
         prefix: str,
     ) -> None:
-        """Copy source into destination without changing source."""
+        """Copy source into destination without changing source.
+
+        destination must initially be zero.
+        scratch must initially be zero.
+        """
 
         copy_test = context.new_label(f"{prefix}_COPY_TEST")
         copy_step = context.new_label(f"{prefix}_COPY_STEP")
@@ -56,6 +86,7 @@ def expand_multiplication(
 
         instructions.extend(
             (
+                # Copy source -> destination and scratch.
                 f"({copy_test}) IF {source} != 0 GOTO {copy_step}",
                 f"IF {guard} != 0 GOTO {restore_test}",
 
@@ -64,6 +95,7 @@ def expand_multiplication(
                 f"{scratch}++",
                 f"IF {guard} != 0 GOTO {copy_test}",
 
+                # Restore source from scratch.
                 f"({restore_test}) IF {scratch} != 0 GOTO {restore_step}",
                 f"IF {guard} != 0 GOTO {done}",
 
@@ -75,30 +107,44 @@ def expand_multiplication(
             )
         )
 
+    # IMPORTANT:
+    #
+    # A macro instruction may be executed repeatedly if it is inside a loop.
+    # Therefore, auxiliary variables cannot be assumed to still contain zero
+    # just because every Z variable starts at zero when the program begins.
+    #
+    # In the previous implementation, left_copy retained its value from the
+    # previous execution. For example:
+    #
+    #     X3 <- Y * Y
+    #
+    # executed first with Y=1 left left_copy=1. When it was executed again
+    # with Y=2, another 2 was copied into left_copy, producing 3 instead of 2.
+    #
+    # Reset all reusable temporaries before starting a new multiplication.
+    clear_variable(left_copy, "MULT_LEFT_COPY")
+    clear_variable(right_copy, "MULT_RIGHT_COPY")
+    clear_variable(add_copy, "MULT_ADD_COPY")
+    clear_variable(scratch, "MULT_SCRATCH")
+
     # Preserve both original operands before modifying dst.
     #
-    # This makes cases such as:
+    # This also allows cases such as:
     #
     #     X1 <- X1 * X2
     #
-    # work correctly.
+    # because X1 is copied before the destination is cleared.
     copy_preserving(left, left_copy, "MULT_LEFT")
     copy_preserving(right, right_copy, "MULT_RIGHT")
 
     # Clear destination.
     clear_test = context.new_label("MULT_CLEAR_TEST")
     clear_step = context.new_label("MULT_CLEAR_STEP")
-
-    instructions.extend(
-        (
-            f"({clear_test}) IF {dst} != 0 GOTO {clear_step}",
-        )
-    )
-
     outer_test = context.new_label("MULT_OUTER_TEST")
 
     instructions.extend(
         (
+            f"({clear_test}) IF {dst} != 0 GOTO {clear_step}",
             f"IF {guard} != 0 GOTO {outer_test}",
 
             f"({clear_step}) {dst}--",
@@ -106,7 +152,7 @@ def expand_multiplication(
         )
     )
 
-    # Multiplication is repeated addition:
+    # Multiplication by repeated addition:
     #
     #     dst = 0
     #
