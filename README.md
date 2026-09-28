@@ -1,99 +1,202 @@
 # L Interpreter
 
-A Python command-line interpreter for **L**, a minimal language used to study computability and partial functions. Based on the [course notes on L-computable functions](doc/Tema02.pdf), this project turns formal instruction semantics into an executable tool for validating programs and inspecting state transitions.
+A Python command-line interpreter for **L**, the minimal language used in Teoría de la Computación. It executes the primitive language from the course notes while also supporting the macro notation used by the UA testing platform.
 
-The implementation demonstrates language parsing, explicit state management, macro expansion, control-flow execution, and CLI design using only the Python standard library.
+The project keeps the runtime small: every macro is expanded to primitive L before execution. This makes it useful both for checking exercises and for inspecting how higher-level operations reduce to the formal language.
 
-**Capabilities**
+## Features
 
-- Parses and executes all four primitive L instructions.
-- Expands variable assignment and unconditional jumps as source-level macros before execution.
-- Discovers macro definitions automatically from the modular `macros/` package.
-- Provides syntax checking, expanded program listings, and step-by-step execution traces.
-- Reports duplicate and undefined labels while preserving their legal execution semantics.
-- Applies a configurable primitive-instruction limit to bound execution when exploring potentially non-terminating programs.
+- Executes all four primitive L instructions: `V++`, `V--`, `V==` and `IF V != 0 GOTO L`.
+- Uses natural-number semantics (`V--` leaves zero unchanged).
+- Accepts both label styles used across the notes/tools: `(A1) Y++` and `A1: Y++`.
+- Accepts standalone labels such as `A1:`; they label the next instruction, or the terminal position at EOF.
+- Supports UA-style source macros with `MACRO ... END` and `CALL`.
+- Implements source-macro placeholders `T1/T2/...`, local auxiliaries `W1/W2/...`, local labels `G1/G2/...`, and continuation label `F`.
+- Supports nested macro calls and detects recursive source-macro cycles.
+- Expands registered Python macros recursively, so one macro may be implemented in terms of another.
+- Auto-discovers modular Python macros from `macros/`.
+- Includes assignment, unconditional jump, addition, truncated subtraction and multiplication macros.
+- Allocates fresh generated `Z` variables and labels without colliding with the source program.
+- Provides syntax checking, expanded listings, execution traces and configurable step limits.
+- Reports duplicate and undefined labels while preserving L execution semantics.
+- Implements the numeric encoding used by the UA reference platform through `encoder.py` and `--encode`, while avoiding accidental construction of impractically huge whole-program integers.
+- Uses only the Python standard library.
 
-**Language reference**
+## Primitive language
 
-Variables hold non-negative integers. Positional inputs initialize `X1`, `X2`, and so on; local variables (`Z1`, `Z2`, …), omitted inputs, and the output variable `Y` start at zero. `X` and `Z` are aliases for `X1` and `Z1`.
+Variables contain non-negative integers.
 
-| Instruction | Behavior |
+- `X1`, `X2`, ... are input variables.
+- `Z1`, `Z2`, ... are auxiliary variables.
+- `Y` is the output variable.
+- `X` and `Z` are accepted as aliases for `X1` and `Z1`.
+
+`X0` and `Z0` are invalid.
+
+| Instruction | Meaning |
 | --- | --- |
-| `V++` | Increment `V` by one. |
-| `V--` | Decrement `V`, leaving zero unchanged. |
-| `V==` | Advance without changing the state. |
-| `IF V != 0 GOTO A` | Jump to label `A` when `V` is nonzero. |
-| `GOTO A` | Built-in macro for an unconditional jump. |
-| `V <- W` | Built-in macro that copies `W` into `V` while preserving `W`. |
+| `V++` | Increment `V`. |
+| `V--` | Decrement `V`; zero remains zero. |
+| `V==` | No operation. |
+| `IF V != 0 GOTO L` | Jump to `L` when `V` is non-zero. |
 
-Labels prefix instructions, for example `(A) Y++`. Keywords, variables, and labels are case-insensitive. The interpreter also accepts Unicode `≠` and `←`, blank lines, and comments beginning with `#` or `//`.
+Execution ends after the final instruction. A taken jump to an undefined label also terminates the program, matching the semantics used in the notes/reference platform.
 
-Execution terminates when it passes the final instruction or takes a jump to an undefined label. If a label appears more than once, jumps target its first occurrence. On termination, `Y` contains the program's result.
-
-**Macro system**
-
-The interpreter runtime only executes the four primitive L operations. Source-level macros are expanded first by the `macros/` package.
+Labels are case-insensitive and may be written in either form:
 
 ```text
-macros/
-├── __init__.py      # Automatic module discovery
-├── registry.py      # Registry and expansion context
-├── assignment.py    # V <- W / V ← W
-└── goto.py          # GOTO L
+A1: Y++
+(A1) Y++
 ```
 
-`macros/__init__.py` automatically imports every non-private `.py` module in the package except `registry.py`. This means a new macro normally requires only one new file; neither `l_interpreter.py` nor `macros/__init__.py` needs to be edited.
-
-Each expansion receives a `MacroExpansionContext` that can allocate fresh `Z` variables and labels without colliding with names already present in the source program.
-
-To add a macro, create a file such as `macros/clear.py`:
-
-```python
-from .registry import IDENTIFIER_PATTERN, macro
-
-
-@macro(
-    name="CLEAR",
-    pattern=rf"\s*CLEAR\s+(?P<var>{IDENTIFIER_PATTERN})\s*",
-    syntax="CLEAR V",
-)
-def expand_clear(match, context):
-    variable = match.group("var")
-    guard = context.new_variable()
-    test = context.new_label("CLEAR_TEST")
-    step = context.new_label("CLEAR_STEP")
-    done = context.new_label("CLEAR_DONE")
-
-    return (
-        f"{guard}++",
-        f"({test}) IF {variable} != 0 GOTO {step}",
-        f"IF {guard} != 0 GOTO {done}",
-        f"({step}) {variable}--",
-        f"IF {guard} != 0 GOTO {test}",
-        f"({done}) {variable}==",
-    )
-```
-
-Expansion functions must return one or more **primitive L instructions**. Registered macro syntax is picked up automatically by the parser and displayed by `--help`. Duplicate macro names are rejected during registration.
-
-**Command-line options**
+A standalone label is also valid:
 
 ```text
+A1:
+Y++
+```
+
+Comments may begin with `#` or `//`.
+
+## Registered macros
+
+Python macro modules live under `macros/` and are discovered automatically.
+
+Current macro syntax includes:
+
+```text
+GOTO A1
+Y <- X1
+Y <- X1 + X2
+Y <- X1 - X2
+Y <- X1 * X2
+```
+
+Subtraction is truncated over the natural numbers:
+
+```text
+2 - 5 = 0
+```
+
+Macro operands are preserved unless the source expression itself writes to one of them. Expansions use fresh internal variables and labels, so constructs such as `X1 <- X1 + X2` are safe.
+
+Registered macros are expanded **recursively**. A new macro may therefore return another registered macro instruction instead of having to reproduce all primitive implementation details itself.
+
+To add a new macro, create another `.py` file inside `macros/` and register it with `@macro(...)`. No central list has to be edited.
+
+## UA-style source macros
+
+The interpreter also understands macros defined directly in a `.l` program, compatible with the macro system in `jcac5-ua/Plataforma-de-pruebas-para-Teoria-de-la-Computacion`.
+
+Example:
+
+```text
+MACRO SALTO
+W1++
+IF W1 != 0 GOTO T1
+END
+
+CALL SALTO A1
+Y++
+A1: Y++
+```
+
+Inside a source macro:
+
+| Token | Meaning |
+| --- | --- |
+| `T1`, `T2`, ... | First, second, ... argument supplied by `CALL`. |
+| `W1`, `W2`, ... | Fresh auxiliary `Z` variable local to that invocation. |
+| `G1`, `G2`, ... | Fresh local label for that invocation. |
+| `F` | Continuation label immediately after that invocation. |
+
+Source macros may call other source macros:
+
+```text
+MACRO OUTER
+CALL INNER T1 W1
+...
+END
+```
+
+Each invocation gets independent `Wn`, `Gn` and `F` names. Direct or indirect recursive macro cycles are rejected instead of expanding forever.
+
+The predefined `COPIA`, `SUMA`, `RESTA` and `SALTO` macro bodies from the UA reference repository are covered by the test suite.
+
+## Running programs
+
+```bash
 python3 l_interpreter.py PROGRAM [INPUT ...] [OPTIONS]
 ```
 
+Positional input values initialize `X1`, `X2`, ... in order.
+
+Examples:
+
+```bash
+python3 l_interpreter.py identity.l 5
+python3 l_interpreter.py sum.l 4 7
+python3 l_interpreter.py program.l --check
+python3 l_interpreter.py program.l --list --check
+python3 l_interpreter.py program.l 5 --trace
+python3 l_interpreter.py program.l --encode --check
+```
+
+Options:
+
 | Option | Purpose |
 | --- | --- |
-| `--check` | Expand macros, parse, and validate without execution. |
-| `--list` | Print the fully expanded primitive program before execution; combine with `--check` to inspect only. |
-| `--trace` | Show primitive instructions, actions, and variable states step by step. |
-| `--max-steps N` | Set a positive primitive-instruction limit; defaults to `100000`. |
-| `--help` | Display usage, primitive syntax, and registered macros. |
+| `--check` | Expand and validate without executing. |
+| `--list` | Print the fully expanded primitive program. |
+| `--trace` | Show primitive execution step by step. |
+| `--encode` | Print exact instruction encodings and the whole-program code when it is reasonably sized. |
+| `--max-steps N` | Override the execution limit (default: `1_000_000`). |
 
-Because macros are genuine source expansions, one macro instruction can execute as several primitive steps. Reaching the step limit does not prove that a program runs forever: it may require more instructions to finish.
+Reaching the step limit does not prove that a program is non-terminating; it may simply require more primitive steps.
 
-**Implementation and scope**
+## Numeric encoding
 
-[l_interpreter.py](l_interpreter.py) contains the primitive parser, execution engine, diagnostics, and command-line handling. [`macros/registry.py`](macros/registry.py) provides the reusable macro infrastructure, while each concrete macro is isolated in its own module.
+`encoder.py` implements the coding scheme used by the reference platform:
 
-This is an educational interpreter. The macro package is extensible in Python, but `.l` source files do not currently define their own macro bodies. Function-call assignment and predicate macros from later parts of the notes can be added as separate files under `macros/` when their intended notation and expansion rules are needed.
+- `Y -> 0`
+- `X_i -> 1 + 2(i-1)`
+- `Z_i -> 2 + 2(i-1)`
+- `== -> 0`, `++ -> 1`, `-- -> 2`
+- conditionals use `2 + code(target label)`
+- instruction triples use the pairing function `2^a(2b+1)-1`
+- programs use prime-power encoding minus one
+
+Canonical labels use the `A1, B1, C1, D1, S1, A2, ...` sequence. Descriptive/generated labels are mapped to free canonical labels for encoding; canonical labels already written in the source are preserved.
+
+Gödel-style whole-program integers grow extremely quickly. `--encode` always reports the exact instruction codes, but skips materializing the final prime-power integer when its estimated size exceeds a safe threshold. `encoder.encode_program_number(...)` remains available when an exact huge integer is explicitly required.
+
+## Project structure
+
+```text
+L_interpreter/
+├── l_interpreter.py
+├── encoder.py
+├── macros/
+│   ├── __init__.py
+│   ├── registry.py
+│   ├── addition.py
+│   ├── assignment.py
+│   ├── goto.py
+│   ├── multiplication.py
+│   └── subtraction.py
+├── tests/
+│   ├── test_encoder.py
+│   └── test_interpreter.py
+└── doc/
+    └── Tema02.pdf
+```
+
+## Tests
+
+Run the standard-library test suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests cover primitive semantics, label compatibility, source macros, nested calls, `F` continuation handling, recursive-expansion protection, subtraction, reference-platform macro compatibility and numeric encoding.

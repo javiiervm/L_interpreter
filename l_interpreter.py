@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Interpreter for the simple computability language L used in the course notes.
+"""Interpreter for the computability language L used in the course notes.
 
-Core L instructions:
+Primitive L instructions:
     V++
     V--
     V==
     IF V != 0 GOTO L
 
-Source-level macro notation is provided by the separate ``macros`` module and
-expanded to primitive L instructions before parsing and execution.
+The interpreter also supports two macro layers:
 
-Variables:
-    X1, X2, ...   input variables
-    Z1, Z2, ...   local variables
-    Y             output variable
+* Registered Python macros from ``macros/`` (assignment, arithmetic, GOTO, ...).
+* Source-defined macros compatible with the UA testing platform::
 
-For convenience, X means X1 and Z means Z1, matching examples in the notes.
+      MACRO NAME
+      ... T1, T2 ... W1, W2 ... G1, G2 ... F ...
+      END
+
+      CALL NAME ARG1 ARG2 ...
+
+``Tn`` denotes the nth call argument, ``Wn`` a fresh auxiliary Z variable,
+``Gn`` a fresh local label and ``F`` the continuation label immediately after
+that macro invocation.
 """
 
 from __future__ import annotations
@@ -25,9 +30,12 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from macros import MACROS, MacroExpansionContext, MacroExpansionError
+
+
+MAX_EXPANSION_DEPTH = 200
 
 
 class LError(Exception):
@@ -35,7 +43,7 @@ class LError(Exception):
 
 
 class LSyntaxError(LError):
-    """Raised when an L source line has invalid syntax."""
+    """Raised when L source has invalid syntax."""
 
 
 class LRuntimeError(LError):
@@ -61,10 +69,29 @@ class Program:
     macro_expansions: int
 
 
-_VAR_RE = re.compile(r"^(?:Y|X\d*|Z\d*)$", re.IGNORECASE)
+@dataclass(frozen=True)
+class _SourceLine:
+    line_no: int
+    text: str
+    raw: str
+
+
+@dataclass(frozen=True)
+class _SourceMacro:
+    name: str
+    body: Tuple[_SourceLine, ...]
+    definition_line: int
+
+
+# X and Z are accepted as aliases for X1 and Z1. X0/Z0 are intentionally
+# rejected: the language numbers variables from 1.
+_VAR_RE = re.compile(r"^(?:Y|X(?:[1-9]\d*)?|Z(?:[1-9]\d*)?)$", re.IGNORECASE)
 _LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
-_LABEL_PREFIX_RE = re.compile(
+_PAREN_LABEL_PREFIX_RE = re.compile(
     r"^\s*\(\s*([A-Za-z][A-Za-z0-9_]*)\s*\)\s*(.*?)\s*$"
+)
+_COLON_LABEL_PREFIX_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$"
 )
 _INC_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*\+\+\s*$", re.IGNORECASE)
 _DEC_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*--\s*$", re.IGNORECASE)
@@ -74,6 +101,13 @@ _IF_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9_]*)\s*$",
     re.IGNORECASE,
 )
+_MACRO_START_RE = re.compile(
+    r"^\s*MACRO\s+([A-Za-z][A-Za-z0-9_]*)\s*$", re.IGNORECASE
+)
+_CALL_RE = re.compile(
+    r"^\s*CALL\s+([A-Za-z][A-Za-z0-9_]*)(?:\s+(.*?))?\s*$", re.IGNORECASE
+)
+_PLACEHOLDER_RE = re.compile(r"\b(?:T[1-9]\d*|W[1-9]\d*|G[1-9]\d*|F)\b", re.IGNORECASE)
 
 
 def normalize_var(name: str) -> str:
@@ -98,26 +132,22 @@ def normalize_label(name: str) -> str:
 
 
 def strip_comment(line: str) -> str:
+    """Remove # or // comments from one source line."""
     hash_pos = line.find("#")
     slash_pos = line.find("//")
     positions = [p for p in (hash_pos, slash_pos) if p != -1]
     if positions:
-        line = line[:min(positions)]
+        line = line[: min(positions)]
     return line.rstrip()
 
 
-def _split_label(source: str, line_no: int) -> tuple[Optional[str], str]:
-    label: Optional[str] = None
-    match = _LABEL_PREFIX_RE.match(source)
-    if match:
-        label = normalize_label(match.group(1))
-        source = match.group(2).strip()
-        if not source:
-            raise LSyntaxError(
-                f"Line {line_no}: a label must prefix an instruction; "
-                "a label-only line is not an L instruction."
-            )
-    return label, source
+def _split_label(source: str) -> tuple[Optional[str], str]:
+    """Split either ``(LABEL) instruction`` or ``LABEL: instruction``."""
+    for regex in (_PAREN_LABEL_PREFIX_RE, _COLON_LABEL_PREFIX_RE):
+        match = regex.match(source)
+        if match:
+            return normalize_label(match.group(1)), match.group(2).strip()
+    return None, source.strip()
 
 
 def _parse_primitive(
@@ -132,97 +162,304 @@ def _parse_primitive(
 
     match = _INC_RE.match(source)
     if match:
-        variable = normalize_var(match.group(1))
-        op, args = "INC", (variable,)
+        op, args = "INC", (normalize_var(match.group(1)),)
 
     if op is None:
         match = _DEC_RE.match(source)
         if match:
-            variable = normalize_var(match.group(1))
-            op, args = "DEC", (variable,)
+            op, args = "DEC", (normalize_var(match.group(1)),)
 
     if op is None:
         match = _NOP_RE.match(source)
         if match:
-            variable = normalize_var(match.group(1))
-            op, args = "NOP", (variable,)
+            op, args = "NOP", (normalize_var(match.group(1)),)
 
     if op is None:
         match = _IF_RE.match(source)
         if match:
-            variable = normalize_var(match.group(1))
-            target = normalize_label(match.group(2))
-            op, args = "IFNZ", (variable, target)
+            op, args = (
+                "IFNZ",
+                (normalize_var(match.group(1)), normalize_label(match.group(2))),
+            )
 
     if op is None:
         macro_syntax = ", ".join(MACROS.syntaxes)
         raise LSyntaxError(
             f"Line {line_no}: cannot parse instruction:\n"
             f"    {raw}\n"
-            "Expected one of the primitive forms V++, V--, V==, "
-            f"IF V != 0 GOTO L, or a registered macro ({macro_syntax})."
+            "Expected V++, V--, V==, IF V != 0 GOTO L, CALL NAME ..., "
+            f"or a registered macro ({macro_syntax})."
         )
 
     return Instruction(line_no, raw.strip(), label, op, args)
 
 
+def _source_lines(text: str) -> list[_SourceLine]:
+    lines: list[_SourceLine] = []
+    for line_no, original in enumerate(text.splitlines(), start=1):
+        cleaned = strip_comment(original).strip()
+        if cleaned:
+            lines.append(_SourceLine(line_no, cleaned, original))
+    return lines
+
+
+def _extract_source_macros(
+    lines: Sequence[_SourceLine],
+) -> tuple[dict[str, _SourceMacro], list[_SourceLine]]:
+    macros: dict[str, _SourceMacro] = {}
+    main_lines: list[_SourceLine] = []
+    current_name: Optional[str] = None
+    current_line = 0
+    current_body: list[_SourceLine] = []
+
+    for line in lines:
+        start = _MACRO_START_RE.fullmatch(line.text)
+        if start:
+            if current_name is not None:
+                raise LSyntaxError(
+                    f"Line {line.line_no}: cannot define macro {start.group(1)} "
+                    f"inside macro {current_name}."
+                )
+            name = start.group(1).upper()
+            if name in macros:
+                raise LSyntaxError(
+                    f"Line {line.line_no}: macro {name} is already defined."
+                )
+            current_name = name
+            current_line = line.line_no
+            current_body = []
+            continue
+
+        if line.text.upper() == "END":
+            if current_name is None:
+                raise LSyntaxError(
+                    f"Line {line.line_no}: END found outside a MACRO definition."
+                )
+            macros[current_name] = _SourceMacro(
+                current_name, tuple(current_body), current_line
+            )
+            current_name = None
+            current_line = 0
+            current_body = []
+            continue
+
+        if current_name is None:
+            main_lines.append(line)
+        else:
+            current_body.append(line)
+
+    if current_name is not None:
+        raise LSyntaxError(
+            f"Line {current_line}: macro {current_name} has no matching END."
+        )
+
+    return macros, main_lines
+
+
+def _replace_macro_placeholders(
+    text: str,
+    *,
+    macro: _SourceMacro,
+    args: Sequence[str],
+    context: MacroExpansionContext,
+    local_variables: dict[str, str],
+    local_labels: dict[str, str],
+    exit_label: str,
+    call_line: int,
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0).upper()
+        kind = token[0]
+
+        if kind == "T":
+            index = int(token[1:]) - 1
+            if index >= len(args):
+                raise LSyntaxError(
+                    f"Line {call_line}: CALL {macro.name} is missing argument {token}."
+                )
+            return args[index]
+
+        if kind == "W":
+            if token not in local_variables:
+                local_variables[token] = context.new_variable()
+            return local_variables[token]
+
+        if kind == "G":
+            if token not in local_labels:
+                local_labels[token] = context.new_label(f"{macro.name}_{token}")
+            return local_labels[token]
+
+        return exit_label  # F
+
+    return _PLACEHOLDER_RE.sub(replace, text)
+
+
+def _expand_lines(
+    lines: Sequence[_SourceLine],
+    *,
+    source_macros: dict[str, _SourceMacro],
+    context: MacroExpansionContext,
+    depth: int = 0,
+    call_stack: tuple[str, ...] = (),
+) -> tuple[list[_SourceLine], int]:
+    if depth > MAX_EXPANSION_DEPTH: 
+        raise LSyntaxError(
+            f"Macro expansion exceeded {MAX_EXPANSION_DEPTH} nested expansions. "
+            "Check for recursive registered macros."
+        )
+
+    result: list[_SourceLine] = []
+    expansion_count = 0
+
+    for line in lines:
+        source_label, body = _split_label(line.text)
+
+        # A standalone label is legal and applies to the next primitive
+        # instruction (or to the terminal position at end of program).
+        if source_label is not None and not body:
+            result.append(_SourceLine(line.line_no, f"{source_label}:", line.raw))
+            continue
+
+        call = _CALL_RE.fullmatch(body)
+        if call:
+            macro_name = call.group(1).upper()
+            macro = source_macros.get(macro_name)
+            if macro is None:
+                raise LSyntaxError(
+                    f"Line {line.line_no}: macro {macro_name} is not defined."
+                )
+            if macro_name in call_stack:
+                chain = " -> ".join((*call_stack, macro_name))
+                raise LSyntaxError(
+                    f"Line {line.line_no}: recursive source macro call detected: {chain}."
+                )
+
+            arg_text = (call.group(2) or "").strip()
+            args = arg_text.split() if arg_text else []
+            local_variables: dict[str, str] = {}
+            local_labels: dict[str, str] = {}
+            exit_label = context.new_label(f"{macro.name}_F")
+
+            instantiated: list[_SourceLine] = []
+            for macro_line in macro.body:
+                translated = _replace_macro_placeholders(
+                    macro_line.text,
+                    macro=macro,
+                    args=args,
+                    context=context,
+                    local_variables=local_variables,
+                    local_labels=local_labels,
+                    exit_label=exit_label,
+                    call_line=line.line_no,
+                )
+                instantiated.append(
+                    _SourceLine(
+                        macro_line.line_no,
+                        translated,
+                        f"CALL {macro_name} @ line {line.line_no}: {macro_line.raw}",
+                    )
+                )
+
+            expanded, nested_count = _expand_lines(
+                instantiated,
+                source_macros=source_macros,
+                context=context,
+                depth=depth + 1,
+                call_stack=(*call_stack, macro_name),
+            )
+
+            if source_label is not None:
+                result.append(_SourceLine(line.line_no, f"{source_label}:", line.raw))
+            result.extend(expanded)
+            result.append(_SourceLine(line.line_no, f"{exit_label}:", line.raw))
+            expansion_count += 1 + nested_count
+            continue
+
+        try:
+            registered = MACROS.expand(body, context)
+        except MacroExpansionError as exc:
+            raise LSyntaxError(f"Line {line.line_no}: {exc}") from exc
+
+        if registered is not None:
+            generated = [
+                _SourceLine(line.line_no, generated_line.strip(), line.raw)
+                for generated_line in registered
+            ]
+            expanded, nested_count = _expand_lines(
+                generated,
+                source_macros=source_macros,
+                context=context,
+                depth=depth + 1,
+                call_stack=call_stack,
+            )
+            if source_label is not None:
+                result.append(_SourceLine(line.line_no, f"{source_label}:", line.raw))
+            result.extend(expanded)
+            expansion_count += 1 + nested_count
+            continue
+
+        if source_label is not None:
+            result.append(
+                _SourceLine(line.line_no, f"{source_label}: {body}", line.raw)
+            )
+        else:
+            result.append(_SourceLine(line.line_no, body, line.raw))
+
+    return result, expansion_count
+
+
 def parse_source(text: str) -> Program:
+    original_lines = _source_lines(text)
+    source_macros, main_lines = _extract_source_macros(original_lines)
+    macro_context = MacroExpansionContext.from_source(text)
+    expanded_lines, macro_expansions = _expand_lines(
+        main_lines,
+        source_macros=source_macros,
+        context=macro_context,
+    )
+
     instructions: List[Instruction] = []
     label_occurrences: Dict[str, List[int]] = {}
     referenced_labels: List[str] = []
-    vars_seen = set()
-    macro_expansions = 0
-    macro_context = MacroExpansionContext.from_source(text)
+    vars_seen: set[str] = set()
+    pending_labels: list[tuple[str, int]] = []
 
-    for line_no, original_line in enumerate(text.splitlines(), start=1):
-        source = strip_comment(original_line).strip()
-        if not source:
+    for line in expanded_lines:
+        label, source = _split_label(line.text)
+        if label is not None and not source:
+            pending_labels.append((label, line.line_no))
             continue
 
-        source_label, source = _split_label(source, line_no)
+        labels_here = list(pending_labels)
+        pending_labels.clear()
+        if label is not None:
+            labels_here.append((label, line.line_no))
 
-        try:
-            expansion = MACROS.expand(source, macro_context)
-        except MacroExpansionError as exc:
-            raise LSyntaxError(f"Line {line_no}: {exc}") from exc
+        display_label = labels_here[0][0] if labels_here else None
+        instruction = _parse_primitive(
+            source,
+            line_no=line.line_no,
+            raw=line.raw,
+            label=display_label,
+        )
+        index = len(instructions)
+        instructions.append(instruction)
 
-        if expansion is None:
-            expanded_lines = [source]
+        for current_label, _ in labels_here:
+            label_occurrences.setdefault(current_label, []).append(index)
+
+        if instruction.op == "IFNZ":
+            variable, target = instruction.args
+            vars_seen.add(variable)
+            referenced_labels.append(target)
         else:
-            macro_expansions += 1
-            expanded_lines = expansion
+            vars_seen.add(instruction.args[0])
 
-        for expansion_index, expanded_line in enumerate(expanded_lines):
-            expanded_source = expanded_line.strip()
-            generated_label, expanded_source = _split_label(expanded_source, line_no)
-
-            label = generated_label
-            if expansion_index == 0 and source_label is not None:
-                if generated_label is not None:
-                    raise LSyntaxError(
-                        f"Line {line_no}: macro expansion cannot place an internal label "
-                        "on its first instruction when the source instruction is labeled."
-                    )
-                label = source_label
-
-            instruction = _parse_primitive(
-                expanded_source,
-                line_no=line_no,
-                raw=original_line,
-                label=label,
-            )
-            index = len(instructions)
-            instructions.append(instruction)
-
-            if instruction.label is not None:
-                label_occurrences.setdefault(instruction.label, []).append(index)
-
-            if instruction.op == "IFNZ":
-                variable, target = instruction.args
-                vars_seen.add(variable)
-                referenced_labels.append(target)
-            else:
-                vars_seen.add(instruction.args[0])
+    # Labels at EOF point to the terminal program position. A taken jump to
+    # one therefore terminates, just like jumping past the last instruction.
+    terminal_index = len(instructions)
+    for label, _ in pending_labels:
+        label_occurrences.setdefault(label, []).append(terminal_index)
 
     labels = {label: indexes[0] for label, indexes in label_occurrences.items()}
     duplicates = {
@@ -237,7 +474,7 @@ def parse_source(text: str) -> Program:
         if variable == "Y":
             return (2, 0)
         prefix = variable[0]
-        number = int(variable[1:]) if len(variable) > 1 else 1
+        number = int(variable[1:])
         return (0 if prefix == "X" else 1, number)
 
     return Program(
@@ -298,7 +535,7 @@ def execute(
     program: Program,
     inputs: Sequence[int],
     *,
-    max_steps: int = 100_000,
+    max_steps: int = 1_000_000,
     trace: bool = False,
 ) -> ExecutionResult:
     if max_steps <= 0:
@@ -342,7 +579,10 @@ def execute(
             if get_value(state, variable) != 0:
                 if target in program.labels:
                     pc = program.labels[target]
-                    action = f"jump -> {target} (instruction {pc + 1})"
+                    if pc < instruction_count:
+                        action = f"jump -> {target} (instruction {pc + 1})"
+                    else:
+                        action = f"jump -> {target} (terminal)"
                 else:
                     pc = instruction_count
                     action = f"jump -> missing label {target}; program terminates"
@@ -384,17 +624,31 @@ def print_program(program: Program) -> None:
     if not program.instructions:
         print("(empty program)")
         return
-    for i, instruction in enumerate(program.instructions, start=1):
-        label = f"({instruction.label}) " if instruction.label else ""
-        print(f"{i:>4}: {label}{instruction_to_text(instruction)}")
+    labels_by_index: dict[int, list[str]] = {}
+    for label, index in program.labels.items():
+        labels_by_index.setdefault(index, []).append(label)
+
+    for i, instruction in enumerate(program.instructions):
+        labels = labels_by_index.get(i, [])
+        label_text = " ".join(f"({label})" for label in labels)
+        if label_text:
+            label_text += " "
+        print(f"{i + 1:<4}: {label_text}{instruction_to_text(instruction)}")
+
+    terminal_labels = labels_by_index.get(len(program.instructions), [])
+    for label in terminal_labels:
+        print(f"     {label}:  [terminal]")
 
 
 def diagnostics(program: Program) -> List[str]:
     warnings: List[str] = []
     for label, indexes in sorted(program.duplicate_labels.items()):
-        display = ", ".join(str(i + 1) for i in indexes)
+        display = ", ".join(
+            "terminal" if i == len(program.instructions) else str(i + 1)
+            for i in indexes
+        )
         warnings.append(
-            f"Label {label} appears more than once (instructions {display}). "
+            f"Label {label} appears more than once ({display}). "
             "A jump to it goes to the first occurrence."
         )
 
@@ -402,7 +656,7 @@ def diagnostics(program: Program) -> List[str]:
     for label in missing:
         warnings.append(
             f"Label {label} is referenced but not defined. "
-            "This is legal under the notes' semantics: taking that jump terminates the program."
+            "Taking that jump terminates the program."
         )
     return warnings
 
@@ -414,7 +668,8 @@ def parse_natural(text: str) -> int:
         raise argparse.ArgumentTypeError(f"'{text}' is not an integer.") from exc
     if value < 0:
         raise argparse.ArgumentTypeError(
-            f"'{text}' is negative. L inputs must be natural numbers."
+            f"'{text}' is negative. L"
+            "inputs must be natural numbers."
         )
     return value
 
@@ -424,8 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="l_interpreter.py",
         description=(
-            "Parse and execute programs in the computability language L "
-            "used in the supplied course notes."
+            "Parse, expand and execute programs in the computability language L."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
@@ -433,23 +687,24 @@ Examples:
   python l_interpreter.py identity.l 5
   python l_interpreter.py sum.l 4 7
   python l_interpreter.py identity.l 5 --trace
-  python l_interpreter.py program.l --check
-  python l_interpreter.py program.l --list
-
-Input values are assigned in order:
-  first number  -> X1
-  second number -> X2
-  third number  -> X3
-  ...
+  python l_interpreter.py program.l --check --list
+  python l_interpreter.py program.l --encode
 
 Core syntax:
   X1++
   Z1--
   Y==
-  IF X1 != 0 GOTO A
-  (A) Y++
+  IF X1 != 0 GOTO A1
+  A1: Y++
+  (A1) Y++
 
-Registered macros (expanded before execution):
+Source macros:
+  MACRO COPY
+  ... T1, W1, G1 and F ...
+  END
+  CALL COPY X1 Y
+
+Registered macros:
 {macro_help}
 
 Conveniences:
@@ -474,18 +729,23 @@ Conveniences:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Expand macros, parse, and validate without executing.",
+        help="Expand macros, parse and validate without executing.",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="Print the expanded primitive program before execution.",
+        help="Print the fully expanded primitive program.",
+    )
+    parser.add_argument(
+        "--encode",
+        action="store_true",
+        help="Print the formal numeric encoding of the expanded primitive program.",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=100_000,
-        help="Stop after this many primitive instructions (default: 100000).",
+        default=1_000_000,
+        help="Stop after this many primitive instructions (default: 1000000).",
     )
     return parser
 
@@ -508,6 +768,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.list:
             print("Expanded primitive program:")
             print_program(program)
+            print()
+
+        if args.encode:
+            from encoder import encode_program, format_encoding
+
+            print(format_encoding(encode_program(program)))
             print()
 
         if warnings:

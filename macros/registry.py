@@ -8,8 +8,9 @@ from typing import Callable, Match, Optional, Pattern, Sequence
 
 
 IDENTIFIER_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
-_VARIABLE_SCAN_RE = re.compile(r"\b(?:Y|X\d*|Z\d*)\b", re.IGNORECASE)
-_LABEL_SCAN_RE = re.compile(r"\(\s*([A-Za-z][A-Za-z0-9_]*)\s*\)")
+_VARIABLE_SCAN_RE = re.compile(r"\b(?:Y|X(?:[1-9]\d*)?|Z(?:[1-9]\d*)?)\b", re.IGNORECASE)
+_PAREN_LABEL_SCAN_RE = re.compile(r"\(\s*([A-Za-z][A-Za-z0-9_]*)\s*\)")
+_COLON_LABEL_SCAN_RE = re.compile(r"(?:^|\n)\s*([A-Za-z][A-Za-z0-9_]*)\s*:", re.MULTILINE)
 
 
 class MacroExpansionError(ValueError):
@@ -28,7 +29,12 @@ class MacroExpansionContext:
     @classmethod
     def from_source(cls, text: str) -> "MacroExpansionContext":
         variables = {match.group(0).upper() for match in _VARIABLE_SCAN_RE.finditer(text)}
-        labels = {match.group(1).upper() for match in _LABEL_SCAN_RE.finditer(text)}
+        labels = {
+            match.group(1).upper() for match in _PAREN_LABEL_SCAN_RE.finditer(text)
+        }
+        labels.update(
+            match.group(1).upper() for match in _COLON_LABEL_SCAN_RE.finditer(text)
+        )
 
         if "X" in variables:
             variables.add("X1")
@@ -47,7 +53,6 @@ class MacroExpansionContext:
         )
 
     def new_variable(self) -> str:
-        """Return a fresh Z variable that does not occur in the source."""
         while True:
             name = f"Z{self.next_variable_index}"
             self.next_variable_index += 1
@@ -56,7 +61,6 @@ class MacroExpansionContext:
                 return name
 
     def new_label(self, stem: str = "STEP") -> str:
-        """Return a fresh label that does not occur in the source."""
         safe_stem = re.sub(r"[^A-Za-z0-9_]", "_", stem.upper()) or "STEP"
         if not safe_stem[0].isalpha():
             safe_stem = f"L_{safe_stem}"
@@ -81,58 +85,32 @@ class MacroDefinition:
 
 
 class MacroRegistry:
-    """Ordered registry of source-level macros."""
-
     def __init__(self) -> None:
         self._definitions: list[MacroDefinition] = []
 
-    def register(
-        self,
-        name: str,
-        pattern: str,
-        syntax: str,
-    ) -> Callable[[MacroExpander], MacroExpander]:
-        """Register a macro expander using a full-line regular expression."""
+    def register(self, name: str, pattern: str, syntax: str):
         compiled = re.compile(pattern, re.IGNORECASE)
         normalized_name = name.upper()
 
         def decorator(expander: MacroExpander) -> MacroExpander:
-            if any(definition.name.upper() == normalized_name for definition in self._definitions):
+            if any(d.name.upper() == normalized_name for d in self._definitions):
                 raise MacroExpansionError(f"Macro {name} is already registered.")
-            self._definitions.append(
-                MacroDefinition(
-                    name=name,
-                    pattern=compiled,
-                    syntax=syntax,
-                    expander=expander,
-                )
-            )
+            self._definitions.append(MacroDefinition(name, compiled, syntax, expander))
             return expander
 
         return decorator
 
-    def expand(
-        self,
-        instruction: str,
-        context: MacroExpansionContext,
-    ) -> Optional[list[str]]:
-        """Expand one macro instruction, or return None when none matches."""
+    def expand(self, instruction: str, context: MacroExpansionContext) -> Optional[list[str]]:
         for definition in self._definitions:
             match = definition.pattern.fullmatch(instruction.strip())
             if match is None:
                 continue
-
             expanded = list(definition.expander(match, context))
             if not expanded:
-                raise MacroExpansionError(
-                    f"Macro {definition.name} expanded to no instructions."
-                )
+                raise MacroExpansionError(f"Macro {definition.name} expanded to no instructions.")
             if any(not line.strip() for line in expanded):
-                raise MacroExpansionError(
-                    f"Macro {definition.name} produced an empty instruction."
-                )
+                raise MacroExpansionError(f"Macro {definition.name} produced an empty instruction.")
             return expanded
-
         return None
 
     @property
@@ -143,10 +121,5 @@ class MacroRegistry:
 MACROS = MacroRegistry()
 
 
-def macro(
-    name: str,
-    pattern: str,
-    syntax: str,
-) -> Callable[[MacroExpander], MacroExpander]:
-    """Register a macro in the shared registry."""
+def macro(name: str, pattern: str, syntax: str):
     return MACROS.register(name, pattern, syntax)
